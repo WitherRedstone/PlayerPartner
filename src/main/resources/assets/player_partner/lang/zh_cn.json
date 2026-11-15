@@ -1,0 +1,7 @@
+{
+  "entity.player_partner.player_partner": "玩家伙伴",
+  "item.player_partner.player_partner_spawn_egg": "玩家伙伴刷怪蛋",
+  "container.player_partner.inventory": "玩家伙伴",
+  "message.player_partner.skin_not_found": "玩家伙伴：找不到名为“%s”的正版账号，请用命名牌写上正确的正版 ID。",
+  "message.player_partner.skin_network_error": "玩家伙伴：无法连接 Minecraft 皮肤服务器，请检查网络连接。"
+}

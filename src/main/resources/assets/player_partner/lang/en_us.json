@@ -1,0 +1,7 @@
+{
+  "entity.player_partner.player_partner": "Player Partner",
+  "item.player_partner.player_partner_spawn_egg": "Player Partner Spawn Egg",
+  "container.player_partner.inventory": "Player Partner",
+  "message.player_partner.skin_not_found": "Player Partner: no premium account named \"%s\" was found. Write a correct premium ID on the name tag.",
+  "message.player_partner.skin_network_error": "Player Partner: could not reach the Minecraft skin server. Please check your network connection."
+}
