@@ -14,11 +14,15 @@ import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.damagesource.DamageSource;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.food.FoodProperties;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.ShieldItem;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 import org.jetbrains.annotations.Nullable;
 
@@ -53,6 +57,14 @@ public class PartnerPlayer extends ServerPlayer {
     private int followStuckTicks;
     /** 有多少玩家正开着这个伙伴的物品栏；大于 0 时伙伴站着不动。 */
     private int menuViewers;
+    /** 举盾防守还剩多少 tick，每次受到伤害都会重新计时。 */
+    private int guardTicks;
+    /** 举盾期间连续没有威胁的 tick 数。 */
+    private int guardIdleTicks;
+    /** 举盾时被换下来的副手物品（一般是食物），防守结束后放回副手。 */
+    private ItemStack stashedOffhand = ItemStack.EMPTY;
+    /** 盾牌原来所在的背包槽位；-1 表示没有从背包里换过盾牌。 */
+    private int shieldSlot = -1;
     /** 是否已经进入移除流程。 */
     private boolean removing;
 
@@ -68,6 +80,11 @@ public class PartnerPlayer extends ServerPlayer {
     private static final int FOLLOW_COOLDOWN_TICKS = 40;
     /** 最多尝试 3 次，还走不到就直接瞬移。 */
     private static final int MAX_FOLLOW_ATTEMPTS = 3;
+
+    /** 受到伤害后举盾防守 5 秒，期间再被打就重新计时。 */
+    private static final int GUARD_TICKS = 100;
+    /** 连续 2 秒没有威胁就提前收盾。 */
+    private static final int GUARD_IDLE_TICKS = 40;
 
     public PartnerPlayer(MinecraftServer server, ServerLevel level, GameProfile profile, ClientInformation information) {
         super(server, level, profile, information);
@@ -89,11 +106,11 @@ public class PartnerPlayer extends ServerPlayer {
             return InteractionResult.PASS;
         }
 
-        // 潜行右键：打开伙伴的物品栏。
+        // 潜行右键：打开伙伴的物品栏。标题直接用伙伴当前的名字，方便区分多个伙伴。
         if (player.isSecondaryUseActive()) {
             player.openMenu(new net.minecraft.world.SimpleMenuProvider(
                             (containerId, inventory, owner) -> new PlayerPartnerMenu(containerId, inventory, this),
-                            Component.translatable("container.player_partner.inventory")),
+                            this.getDisplayNameForMenu()),
                     buffer -> buffer.writeUUID(this.getUUID()));
             return InteractionResult.sidedSuccess(false);
         }
@@ -179,6 +196,10 @@ public class PartnerPlayer extends ServerPlayer {
         return this.menuViewers > 0;
     }
 
+    public Component getDisplayNameForMenu() {
+        return this.getName();
+    }
+
     private void tickBehaviour() {
         if (this.removing || !this.isAlive()) {
             return;
@@ -193,6 +214,7 @@ public class PartnerPlayer extends ServerPlayer {
             return;
         }
 
+        this.tickShield();
         this.tickEating();
 
         if (this.isUsingItem()) {
@@ -441,8 +463,128 @@ public class PartnerPlayer extends ServerPlayer {
         this.setXRot((float) Mth.approach(this.getXRot(), pitch, 15.0F));
     }
 
+    @Override
+    public boolean hurt(DamageSource source, float amount) {
+        if (!this.level().isClientSide) {
+            this.beginGuard();
+        }
+        return super.hurt(source, amount);
+    }
+
+    private void beginGuard() {
+        this.guardTicks = GUARD_TICKS;
+        this.guardIdleTicks = 0;
+
+        // 副手本来就拿着盾牌（玩家自己放的），直接举起来。
+        if (this.getOffhandItem().getItem() instanceof ShieldItem) {
+            if (!this.isUsingItem()) {
+                this.startUsingItem(InteractionHand.OFF_HAND);
+            }
+            return;
+        }
+        // 已经从背包里换过一次盾牌，还在防守中，不用再换。
+        if (this.shieldSlot >= 0) {
+            return;
+        }
+
+        Inventory inventory = this.getInventory();
+        for (int slot = 0; slot < 36; slot++) {
+            if (!(inventory.getItem(slot).getItem() instanceof ShieldItem)) {
+                continue;
+            }
+            // 副手一般是食物，先存起来，防守结束后放回去。
+            this.stashedOffhand = inventory.getItem(Inventory.SLOT_OFFHAND).copy();
+            ItemStack shield = inventory.getItem(slot).copy();
+            inventory.setItem(slot, this.stashedOffhand.copy());
+            inventory.setItem(Inventory.SLOT_OFFHAND, shield);
+            inventory.setChanged();
+            this.shieldSlot = slot;
+            this.stopUsingItem();
+            this.startUsingItem(InteractionHand.OFF_HAND);
+            return;
+        }
+    }
+
+    /** 举盾期间的维护：面朝威胁、盾牌被打断就重新举、威胁消失后收盾。 */
+    private void tickShield() {
+        if (this.guardTicks <= 0) {
+            return;
+        }
+
+        this.guardTicks--;
+        if (this.getOffhandItem().getItem() instanceof ShieldItem) {
+            if (!this.isUsingItem()) {
+                this.startUsingItem(InteractionHand.OFF_HAND);
+            }
+            LivingEntity threat = this.findThreat();
+            if (threat != null) {
+                // 盾牌只挡“正面”的伤害，所以举盾时要面朝威胁方向。
+                this.lookAt(threat.getX(), threat.getEyeY(), threat.getZ());
+                this.guardIdleTicks = 0;
+            } else if (++this.guardIdleTicks > GUARD_IDLE_TICKS) {
+                // 2 秒没有威胁就提前收盾，不用一直举到时间结束。
+                this.guardTicks = 0;
+            }
+        }
+
+        if (this.guardTicks <= 0) {
+            this.endGuard();
+        }
+    }
+
+    private void endGuard() {
+        this.stopUsingItem();
+        this.guardIdleTicks = 0;
+        if (this.shieldSlot < 0) {
+            return;
+        }
+
+        Inventory inventory = this.getInventory();
+        ItemStack shield = inventory.getItem(Inventory.SLOT_OFFHAND);
+        ItemStack food = this.stashedOffhand;
+        inventory.setItem(Inventory.SLOT_OFFHAND, food.copy());
+
+        ItemStack current = inventory.getItem(this.shieldSlot);
+        if (current.isEmpty() || ItemStack.isSameItemSameComponents(current, food)) {
+            inventory.setItem(this.shieldSlot, shield.copy());
+        } else {
+            // 防守期间玩家动过这个槽位，盾牌就塞回背包空位，塞不下丢在脚边。
+            if (!inventory.add(shield.copy())) {
+                this.drop(shield.copy(), false);
+            }
+        }
+
+        inventory.setChanged();
+        this.stashedOffhand = ItemStack.EMPTY;
+        this.shieldSlot = -1;
+    }
+
+    @Nullable
+    private LivingEntity findThreat() {
+        Player owner = this.getOwner();
+        AABB area = this.getBoundingBox().inflate(6.0D, 3.0D, 6.0D);
+        LivingEntity nearest = null;
+        double nearestDistance = Double.MAX_VALUE;
+        for (Mob mob : this.level().getEntitiesOfClass(Mob.class, area, Mob::isAlive)) {
+            LivingEntity target = mob.getTarget();
+            if (target != this && target != owner) {
+                continue;
+            }
+            double distance = mob.distanceToSqr(this);
+            if (distance < nearestDistance) {
+                nearestDistance = distance;
+                nearest = mob;
+            }
+        }
+        return nearest;
+    }
+
     private void tickEating() {
         if (this.isUsingItem()) {
+            return;
+        }
+        // 副手拿着盾牌时不要拿盾牌当食物槽，避免把盾牌换走。
+        if (this.getOffhandItem().getItem() instanceof ShieldItem) {
             return;
         }
         if (this.getFoodData().getFoodLevel() >= 20) {

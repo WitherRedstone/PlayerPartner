@@ -120,7 +120,7 @@ public final class PPCommands {
 
         OptionalInt opened = player.openMenu(new SimpleMenuProvider(
                         (containerId, inventory, p) -> new PlayerPartnerMenu(containerId, inventory, partner),
-                        Component.translatable("container.player_partner.inventory")),
+                        partner.getDisplayNameForMenu()),
                 buffer -> buffer.writeUUID(partner.getUUID()));
         if (opened.isEmpty()) {
             context.getSource().sendFailure(Component.literal("无法打开伙伴的物品栏"));
