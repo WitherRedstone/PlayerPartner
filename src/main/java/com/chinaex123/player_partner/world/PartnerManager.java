@@ -24,13 +24,11 @@ import net.minecraft.server.network.CommonListenerCookie;
 import net.neoforged.neoforge.network.connection.ConnectionType;
 import net.minecraft.world.entity.HumanoidArm;
 import net.minecraft.world.entity.player.ChatVisiblity;
-import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.world.entity.player.Inventory;
-import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.phys.Vec3;
 import org.jetbrains.annotations.Nullable;
 
@@ -68,7 +66,8 @@ public final class PartnerManager {
     }
 
     public record PartnerRecord(String displayName, String skinName, @Nullable UUID owner,
-                                ResourceKey<Level> dimension, double x, double y, double z, float yaw, String job) {
+                                ResourceKey<Level> dimension, double x, double y, double z, float yaw, String job,
+                                float health, int food, float saturation, float exhaustion) {
     }
 
     public void onServerStarted() {
@@ -125,12 +124,18 @@ public final class PartnerManager {
                                   Vec3 pos, float yaw, @Nullable GameProfile skinProfile) {
         PartnerPlayer existing = this.getPartner(displayName);
         PartnerJob previousJob = existing == null ? PartnerJob.NONE : existing.getJob();
+        // 同名伙伴被替换时，把当前血量与饥饿一起带过去，别让它“满血复活”。
+        float health = existing == null ? -1.0F : existing.getHealth();
+        int food = existing == null ? 20 : existing.getFoodData().getFoodLevel();
+        float saturation = existing == null ? 5.0F : existing.getFoodData().getSaturationLevel();
+        float exhaustion = existing == null ? 0.0F : existing.getFoodData().getExhaustionLevel();
         if (existing != null) {
             this.remove(existing, false);
         }
 
         PartnerRecord record = new PartnerRecord(displayName, skinName, owner,
-                level.dimension(), pos.x, pos.y, pos.z, yaw, previousJob.id());
+                level.dimension(), pos.x, pos.y, pos.z, yaw, previousJob.id(),
+                health, food, saturation, exhaustion);
         this.records.removeIf(old -> old.displayName().equalsIgnoreCase(displayName));
         this.records.add(record);
         this.place(record, skinProfile);
@@ -169,7 +174,8 @@ public final class PartnerManager {
                     this.remove(partner, false);
 
                     this.records.removeIf(old -> old.displayName().equalsIgnoreCase(trimmed));
-                    PartnerRecord renamed = new PartnerRecord(trimmed, trimmed, record.owner(), dimension, x, y, z, yaw, record.job());
+                    PartnerRecord renamed = new PartnerRecord(trimmed, trimmed, record.owner(), dimension, x, y, z, yaw,
+                            record.job(), record.health(), record.food(), record.saturation(), record.exhaustion());
                     this.records.add(renamed);
                     if (result.profile() != null) {
                         this.place(renamed, result.profile());
@@ -232,9 +238,12 @@ public final class PartnerManager {
                 new CommonListenerCookie(profile, 0, PARTNER_CLIENT_INFO, false, ConnectionType.OTHER));
 
         partner.setGameMode(GameType.SURVIVAL);
-        partner.setHealth(partner.getMaxHealth());
-        partner.getFoodData().setFoodLevel(20);
-        partner.getFoodData().setSaturation(5.0F);
+        float savedHealth = record.health() > 0.0F ? Math.min(record.health(), partner.getMaxHealth())
+                : partner.getMaxHealth();
+        partner.setHealth(Math.max(1.0F, savedHealth));
+        partner.getFoodData().setFoodLevel(record.food());
+        partner.getFoodData().setSaturation(record.saturation());
+        partner.getFoodData().setExhaustion(record.exhaustion());
         partner.setJob(PartnerJob.byName(record.job()));
 
         if (partner.serverLevel() != spawnLevel) {
@@ -297,13 +306,18 @@ public final class PartnerManager {
         return this.active.get(uuid);
     }
 
+    private static PartnerRecord withState(PartnerRecord record, PartnerPlayer partner) {
+        return new PartnerRecord(record.displayName(), record.skinName(), record.owner(),
+                partner.level().dimension(), partner.getX(), partner.getY(), partner.getZ(), partner.getYRot(),
+                partner.getJob().id(), partner.getHealth(), partner.getFoodData().getFoodLevel(),
+                partner.getFoodData().getSaturationLevel(), partner.getFoodData().getExhaustionLevel());
+    }
+
     public void persistJob(PartnerPlayer partner) {
         for (int index = 0; index < this.records.size(); index++) {
             PartnerRecord record = this.records.get(index);
             if (PartnerPlayer.createUuid(record.displayName()).equals(partner.getUUID())) {
-                this.records.set(index, new PartnerRecord(record.displayName(), record.skinName(), record.owner(),
-                        record.dimension(), record.x(), record.y(), record.z(), record.yaw(),
-                        partner.getJob().id()));
+                this.records.set(index, withState(record, partner));
                 this.save();
                 return;
             }
@@ -320,9 +334,7 @@ public final class PartnerManager {
                 updated.add(record);
                 continue;
             }
-            updated.add(new PartnerRecord(record.displayName(), record.skinName(), record.owner(),
-                    partner.level().dimension(), partner.getX(), partner.getY(), partner.getZ(), partner.getYRot(),
-                    partner.getJob().id()));
+            updated.add(withState(record, partner));
         }
         this.records.clear();
         this.records.addAll(updated);
@@ -344,6 +356,10 @@ public final class PartnerManager {
                 object.addProperty("z", record.z());
                 object.addProperty("yaw", record.yaw());
                 object.addProperty("job", record.job());
+                object.addProperty("health", record.health());
+                object.addProperty("food", record.food());
+                object.addProperty("saturation", record.saturation());
+                object.addProperty("exhaustion", record.exhaustion());
                 array.add(object);
             }
             try (Writer writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
@@ -377,7 +393,11 @@ public final class PartnerManager {
                         object.get("y").getAsDouble(),
                         object.get("z").getAsDouble(),
                         object.get("yaw").getAsFloat(),
-                        object.has("job") ? object.get("job").getAsString() : PartnerJob.NONE.id()));
+                        object.has("job") ? object.get("job").getAsString() : PartnerJob.NONE.id(),
+                        object.has("health") ? object.get("health").getAsFloat() : -1.0F,
+                        object.has("food") ? object.get("food").getAsInt() : 20,
+                        object.has("saturation") ? object.get("saturation").getAsFloat() : 5.0F,
+                        object.has("exhaustion") ? object.get("exhaustion").getAsFloat() : 0.0F));
             }
         } catch (Exception exception) {
             PlayerPartner.LOGGER.warn("无法读取玩家伙伴列表", exception);

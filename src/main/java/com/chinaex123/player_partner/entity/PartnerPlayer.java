@@ -24,6 +24,7 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.MoverType;
 import net.minecraft.world.entity.ai.attributes.AttributeInstance;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.monster.Monster;
@@ -85,6 +86,13 @@ public class PartnerPlayer extends ServerPlayer {
     private int shieldSlot = -1;
     /** 受击后的僵直 tick 数：这段时间不接管移动，让击退真的把人推出去。 */
     private int staggerTicks;
+    /** 受击击退的剩余水平速度。 */
+    private double pushX;
+    private double pushZ;
+    /** 击退里的竖直分量，做出“小跳一下”的抛物线。 */
+    private double pushY;
+    /** 击退还剩几 tick 的推力。 */
+    private int pushTicks;
     /** 上一 tick 的位置，用来给假玩家补算原版的移动疲劳。 */
     private double lastMoveX;
     private double lastMoveY;
@@ -285,11 +293,20 @@ public class PartnerPlayer extends ServerPlayer {
 
         this.setJumping(false);
 
-        // 被打了，这一小段时间完全不接管移动，让击退真的把人推出去。
+        // 被打了，这一小段时间完全不接管移动，
         if (this.staggerTicks > 0) {
             this.staggerTicks--;
             this.zza = 0.0F;
             this.xxa = 0.0F;
+            if (this.pushTicks > 0) {
+                this.pushTicks--;
+                // 水平与竖直都自己按位移推：位置包一定会同步，客户端看到的才是真位移；
+                // pushY 每 tick 减 0.08、乘 0.9，走出一个先升后落的小抛物线。
+                this.move(MoverType.SELF, new Vec3(this.pushX, this.pushY, this.pushZ));
+                this.pushX *= 0.55D;
+                this.pushZ *= 0.55D;
+                this.pushY = (this.pushY - 0.08D) * 0.9D;
+            }
             return;
         }
 
@@ -862,6 +879,11 @@ public class PartnerPlayer extends ServerPlayer {
             return super.hurt(source, amount);
         }
 
+        // 伙伴之间互不伤害。
+        if (source.getEntity() instanceof PartnerPlayer) {
+            return false;
+        }
+
         // 被打之后先“僵直”半秒，别立刻又往目标走。
         this.staggerTicks = STAGGER_TICKS;
         this.beginGuard();
@@ -880,9 +902,13 @@ public class PartnerPlayer extends ServerPlayer {
                     dx = 0.0D;
                     dz = 1.0D;
                 }
-                // 假玩家没有客户端，原版击退的位移常常被 AI 的行走输入吃掉，
-                // 这里显式再补一次水平冲量，并打上 hurtMarked 让服务器把速度包广播出去。
-                this.setDeltaMovement(dx * 0.35D, Math.max(this.getDeltaMovement().y, 0.35D), dz * 0.35D);
+
+                double resistance = Math.max(0.0D, 1.0D - this.getAttributeValue(Attributes.KNOCKBACK_RESISTANCE));
+                this.pushX = dx * 0.42D * resistance;
+                this.pushZ = dz * 0.42D * resistance;
+                this.pushY = (this.onGround() ? 0.32D : 0.12D) * resistance;
+                this.pushTicks = 6;
+                this.hasImpulse = true;
                 this.hurtMarked = true;
             }
         }
