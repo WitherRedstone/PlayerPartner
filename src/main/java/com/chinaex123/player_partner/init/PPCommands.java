@@ -1,19 +1,26 @@
 package com.chinaex123.player_partner.init;
 
 import com.chinaex123.player_partner.PlayerPartner;
-import com.chinaex123.player_partner.entity.PartnerPlayer;
 import com.chinaex123.player_partner.client.menu.PlayerPartnerMenu;
+import com.chinaex123.player_partner.entity.PartnerPlayer;
+import com.chinaex123.player_partner.world.MiningRules;
 import com.chinaex123.player_partner.world.PartnerManager;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
+import com.mojang.datafixers.util.Either;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
+import net.minecraft.commands.arguments.ResourceOrTagKeyArgument;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.tags.TagKey;
 import net.minecraft.world.SimpleMenuProvider;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.List;
@@ -40,7 +47,19 @@ public final class PPCommands {
                 .then(Commands.literal("open")
                         .executes(PPCommands::openNearest))
                 .then(Commands.literal("list")
-                        .executes(PPCommands::list)));
+                        .executes(PPCommands::list))
+                .then(Commands.literal("mining")
+                        .then(Commands.literal("mode")
+                                .then(Commands.literal("whitelist").executes(context -> setMiningMode(context, true)))
+                                .then(Commands.literal("blacklist").executes(context -> setMiningMode(context, false))))
+                        .then(Commands.literal("add")
+                                .then(Commands.argument("filter", ResourceOrTagKeyArgument.resourceOrTagKey(Registries.BLOCK))
+                                        .executes(PPCommands::addMiningFilter)))
+                        .then(Commands.literal("remove")
+                                .then(Commands.argument("filter", ResourceOrTagKeyArgument.resourceOrTagKey(Registries.BLOCK))
+                                        .executes(PPCommands::removeMiningFilter)))
+                        .then(Commands.literal("list").executes(PPCommands::listMiningFilters))
+                        .then(Commands.literal("clear").executes(PPCommands::clearMiningFilters))));
     }
 
     private static int spawn(CommandContext<CommandSourceStack> context, String displayName, String skinName) {
@@ -128,6 +147,7 @@ public final class PPCommands {
         }
         return 1;
     }
+
     private static int list(CommandContext<CommandSourceStack> context) {
         PartnerManager manager = PartnerManager.get(context.getSource().getServer());
         List<String> names = manager.getRecords().stream()
@@ -140,6 +160,60 @@ public final class PPCommands {
                     String.join("、", names)), false);
         }
         return 1;
+    }
+
+    private static int setMiningMode(CommandContext<CommandSourceStack> context, boolean whitelist) {
+        MiningRules rules = MiningRules.get(context.getSource().getServer());
+        rules.setWhitelistMode(whitelist);
+        context.getSource().sendSuccess(() -> Component.literal("挖矿过滤切到" + (whitelist ? "白名单" : "黑名单")
+                + "模式，立刻生效：" + rules.describe()), true);
+        return 1;
+    }
+
+    private static int addMiningFilter(CommandContext<CommandSourceStack> context) {
+        MiningRules rules = MiningRules.get(context.getSource().getServer());
+        String entry = miningEntry(context);
+        if (!rules.add(entry)) {
+            context.getSource().sendFailure(Component.literal("没加进去：要么这条已经有了，要么写法不对 -> " + entry));
+            return 0;
+        }
+        context.getSource().sendSuccess(() -> Component.literal("已加入挖矿过滤（" + rules.describe() + "）"), true);
+        return 1;
+    }
+
+    private static int removeMiningFilter(CommandContext<CommandSourceStack> context) {
+        MiningRules rules = MiningRules.get(context.getSource().getServer());
+        String entry = miningEntry(context);
+        if (!rules.remove(entry)) {
+            context.getSource().sendFailure(Component.literal("列表里没有这一条：" + entry));
+            return 0;
+        }
+        context.getSource().sendSuccess(() -> Component.literal("已从挖矿过滤里移除（" + rules.describe() + "）"), true);
+        return 1;
+    }
+
+    private static int listMiningFilters(CommandContext<CommandSourceStack> context) {
+        MiningRules rules = MiningRules.get(context.getSource().getServer());
+        context.getSource().sendSuccess(() -> Component.literal("挖矿过滤：" + rules.describe()), false);
+        return 1;
+    }
+
+    private static int clearMiningFilters(CommandContext<CommandSourceStack> context) {
+        MiningRules rules = MiningRules.get(context.getSource().getServer());
+        rules.clear();
+        String hint = rules.isWhitelistMode() ? "（白名单为空 = 什么都能挖）" : "（黑名单为空 = 什么都能挖）";
+        context.getSource().sendSuccess(() -> Component.literal("已清空挖矿过滤" + hint), true);
+        return 1;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String miningEntry(CommandContext<CommandSourceStack> context) {
+        ResourceOrTagKeyArgument.Result<Block> result = context.getArgument("filter", ResourceOrTagKeyArgument.Result.class);
+        Either<ResourceKey<Block>, TagKey<Block>> unwrapped = result.unwrap();
+        if (unwrapped.left().isPresent()) {
+            return unwrapped.left().get().location().toString();
+        }
+        return "#" + unwrapped.right().orElseThrow().location();
     }
 
     private static PartnerPlayer findNearest(PartnerManager manager, Player player) {

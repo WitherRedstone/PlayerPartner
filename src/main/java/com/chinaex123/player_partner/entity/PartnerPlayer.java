@@ -2,34 +2,52 @@ package com.chinaex123.player_partner.entity;
 
 import com.mojang.authlib.GameProfile;
 import com.chinaex123.player_partner.client.menu.PlayerPartnerMenu;
+import com.chinaex123.player_partner.config.PPConfig;
+import com.chinaex123.player_partner.world.MiningRules;
 import com.chinaex123.player_partner.world.PartnerManager;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.UUIDUtil;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ClientInformation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.tags.BlockTags;
+import net.minecraft.tags.DamageTypeTags;
 import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
+import net.minecraft.world.SimpleMenuProvider;
 import net.minecraft.world.damagesource.DamageSource;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.ai.attributes.AttributeInstance;
 import net.minecraft.world.entity.ai.attributes.Attributes;
+import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.food.FoodProperties;
-import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.ShieldItem;
+import net.minecraft.world.item.*;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.CropBlock;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.util.List;
 import java.util.UUID;
+import java.util.function.Predicate;
 
 public class PartnerPlayer extends ServerPlayer {
     public static final String MARKER = "player_partner";
+    /** 受击后“僵直”的 tick 数：这段时间不接管移动，让原版击退把人推出去。 */
+    private static final int STAGGER_TICKS = 10;
 
     /** 主人的 UUID。 */
     @Nullable
@@ -65,6 +83,12 @@ public class PartnerPlayer extends ServerPlayer {
     private ItemStack stashedOffhand = ItemStack.EMPTY;
     /** 盾牌原来所在的背包槽位；-1 表示没有从背包里换过盾牌。 */
     private int shieldSlot = -1;
+    /** 受击后的僵直 tick 数：这段时间不接管移动，让击退真的把人推出去。 */
+    private int staggerTicks;
+    /** 上一 tick 的位置，用来给假玩家补算原版的移动疲劳。 */
+    private double lastMoveX;
+    private double lastMoveY;
+    private double lastMoveZ;
     /** 是否已经进入移除流程。 */
     private boolean removing;
 
@@ -86,9 +110,30 @@ public class PartnerPlayer extends ServerPlayer {
     /** 连续 2 秒没有威胁就提前收盾。 */
     private static final int GUARD_IDLE_TICKS = 40;
 
+    private PartnerJob job = PartnerJob.NONE;
+
+    /** 战斗任务当前盯上的目标。 */
+    @Nullable
+    private LivingEntity jobTarget;
+    /** 挖矿 / 砍树 / 耕种当前盯着的方块。 */
+    @Nullable
+    private BlockPos jobPos;
+    /** 当前方块已经挖了多少 tick。 */
+    private int jobBreakTicks;
+    /** 搜索方块目标的冷却，避免每 tick 都扫一大圈。 */
+    private int jobScanCooldown;
+    /** 攻击冷却，避免每 tick 都挥一下。 */
+    private int attackCooldown;
+
     public PartnerPlayer(MinecraftServer server, ServerLevel level, GameProfile profile, ClientInformation information) {
         super(server, level, profile, information);
         this.getAttribute(Attributes.SCALE).setBaseValue(0.5D);
+        AttributeInstance maxHealth = this.getAttribute(Attributes.MAX_HEALTH);
+        if (maxHealth != null) {
+            maxHealth.setBaseValue(PPConfig.PARTNER_MAX_HEALTH.get());
+        }
+        this.setHealth(this.getMaxHealth());
+
         this.refreshDimensions();
     }
 
@@ -100,15 +145,32 @@ public class PartnerPlayer extends ServerPlayer {
         return UUIDUtil.createOfflinePlayerUUID("PlayerPartner:" + displayName);
     }
 
+    /** 伙伴当前在做什么。 */
+    public PartnerJob getJob() {
+        return this.job;
+    }
+
+    /** 给伙伴换个任务；换任务时清掉之前盯着的目标和方块，并把任务写进存档。 */
+    public void setJob(PartnerJob job) {
+        this.job = job;
+        this.jobTarget = null;
+        this.jobPos = null;
+        this.jobBreakTicks = 0;
+        this.jobScanCooldown = 0;
+        if (!this.level().isClientSide) {
+            PartnerManager.get(this.server).persistJob(this);
+        }
+    }
+
     @Override
-    public InteractionResult interact(Player player, InteractionHand hand) {
+    public @NotNull InteractionResult interact(Player player, InteractionHand hand) {
         if (this.level().isClientSide || !this.isAlive()) {
             return InteractionResult.PASS;
         }
 
-        // 潜行右键：打开伙伴的物品栏。标题直接用伙伴当前的名字，方便区分多个伙伴。
+        // 潜行右键：打开伙伴的物品栏。
         if (player.isSecondaryUseActive()) {
-            player.openMenu(new net.minecraft.world.SimpleMenuProvider(
+            player.openMenu(new SimpleMenuProvider(
                             (containerId, inventory, owner) -> new PlayerPartnerMenu(containerId, inventory, this),
                             this.getDisplayNameForMenu()),
                     buffer -> buffer.writeUUID(this.getUUID()));
@@ -118,8 +180,8 @@ public class PartnerPlayer extends ServerPlayer {
         // 用命名牌改名（同时换皮肤）。
         if (player instanceof ServerPlayer serverPlayer && hand == InteractionHand.MAIN_HAND) {
             ItemStack stack = player.getMainHandItem();
-            Component customName = stack.get(net.minecraft.core.component.DataComponents.CUSTOM_NAME);
-            if (stack.is(net.minecraft.world.item.Items.NAME_TAG) && customName != null) {
+            Component customName = stack.get(DataComponents.CUSTOM_NAME);
+            if (stack.is(Items.NAME_TAG) && customName != null) {
                 String newName = customName.getString().trim();
                 if (!newName.isEmpty()) {
                     if (!serverPlayer.getAbilities().instabuild) {
@@ -143,9 +205,26 @@ public class PartnerPlayer extends ServerPlayer {
         super.tick();
         this.doTick();
 
-        if (!this.level().isClientSide && this.tickCount % 10 == 0) {
-            this.connection.resetPosition();
-            this.serverLevel().getChunkSource().move(this);
+        if (!this.level().isClientSide) {
+            double dx = this.getX() - this.lastMoveX;
+            double dz = this.getZ() - this.lastMoveZ;
+            this.lastMoveX = this.getX();
+            this.lastMoveY = this.getY();
+            this.lastMoveZ = this.getZ();
+            if (this.tickCount > 1 && !this.isPassenger()) {
+                double distance = Math.sqrt(dx * dx + dz * dz);
+                if (distance > 1.0E-4D) {
+                    this.causeFoodExhaustion((float) (distance * 0.1D));
+                }
+                if (this.jumping && this.onGround()) {
+                    this.causeFoodExhaustion(0.1F);
+                }
+            }
+
+            if (this.tickCount % 10 == 0) {
+                this.connection.resetPosition();
+                this.serverLevel().getChunkSource().move(this);
+            }
         }
     }
 
@@ -183,7 +262,6 @@ public class PartnerPlayer extends ServerPlayer {
         return this.removing;
     }
 
-    /** 有玩家打开这个伙伴的物品栏时记一笔，界面关掉之前伙伴不会乱走。 */
     public void onMenuOpened() {
         this.menuViewers++;
     }
@@ -207,7 +285,15 @@ public class PartnerPlayer extends ServerPlayer {
 
         this.setJumping(false);
 
-        // 有人正开着伙伴的物品栏：站着别动，看着界面就行，等界面关掉再继续活动。
+        // 被打了，这一小段时间完全不接管移动，让击退真的把人推出去。
+        if (this.staggerTicks > 0) {
+            this.staggerTicks--;
+            this.zza = 0.0F;
+            this.xxa = 0.0F;
+            return;
+        }
+
+        // 有人正开着伙伴的物品栏，站着别动，看着界面就行，等界面关掉再继续活动。
         if (this.isMenuOpen()) {
             this.zza = 0.0F;
             this.xxa = 0.0F;
@@ -221,6 +307,13 @@ public class PartnerPlayer extends ServerPlayer {
             this.zza = 0.0F;
             this.xxa = 0.0F;
             this.setJumping(false);
+            return;
+        }
+
+        // 有任务时先干活：工作会各自接管移动，干完了才回到闲逛。
+        PartnerJob job = this.getJob();
+        if (job != PartnerJob.NONE) {
+            this.tickJob(job);
             return;
         }
 
@@ -271,6 +364,306 @@ public class PartnerPlayer extends ServerPlayer {
                 this.tickIdleLook();
             }
         }
+    }
+
+    /** 按当前任务分派，每个任务自己负责移动和交互。 */
+    private void tickJob(PartnerJob job) {
+        switch (job) {
+            case COMBAT -> this.tickCombatJob();
+            case MINING -> this.tickMiningJob();
+            case CHOPPING -> this.tickChoppingJob();
+            case FARMING -> this.tickFarmingJob();
+            default -> {
+            }
+        }
+    }
+
+    /** 站住不动，但像闲逛时一样四处张望。 */
+    private void idleForJob() {
+        this.zza = 0.0F;
+        this.xxa = 0.0F;
+        this.tickIdleLook();
+    }
+
+    private void tickCombatJob() {
+        if (this.attackCooldown > 0) {
+            this.attackCooldown--;
+        }
+
+        // 每半秒重新挑一次目标；目标死了或者跑没影了也重新挑。
+        if (this.tickCount % 10 == 0 || this.jobTarget == null || !this.jobTarget.isAlive()) {
+            this.jobTarget = this.pickCombatTarget();
+        }
+
+        LivingEntity target = this.jobTarget;
+        if (target == null) {
+            this.idleForJob();
+            return;
+        }
+
+        this.lookAt(target.getX(), target.getEyeY(), target.getZ());
+
+        // 伙伴只有一半体型，够得着的距离也短一点。
+        if (this.distanceToSqr(target) > 2.5D * 2.5D) {
+            this.moveTowards(target.position());
+            return;
+        }
+
+        this.zza = 0.0F;
+        this.xxa = 0.0F;
+        if (this.attackCooldown <= 0) {
+            this.swing(InteractionHand.MAIN_HAND);
+            this.attack(target);
+            this.resetAttackStrengthTicker();
+            this.attackCooldown = 20;
+        }
+    }
+
+    /** 优先打主人正在打的怪，其次打附近盯上主人或自己的怪。 */
+    @Nullable
+    private LivingEntity pickCombatTarget() {
+        Player owner = this.getOwner();
+        if (owner != null && owner.level() == this.level()) {
+            LivingEntity hurt = owner.getLastHurtMob();
+            if (hurt instanceof Monster monster && this.canFight(monster)) {
+                return monster;
+            }
+        }
+
+        int radius = PPConfig.JOB_RADIUS.get();
+        AABB area = this.getBoundingBox().inflate(radius, 4.0D, radius);
+        LivingEntity best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (Monster monster : this.level().getEntitiesOfClass(Monster.class, area, this::canFight)) {
+            double distance = monster.distanceToSqr(this);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = monster;
+            }
+        }
+        return best;
+    }
+
+    private boolean canFight(Monster monster) {
+        return monster.isAlive()
+                && !monster.isRemoved()
+                && !monster.isInvulnerable()
+                && monster.distanceToSqr(this) <= (double) PPConfig.JOB_RADIUS.get() * PPConfig.JOB_RADIUS.get() * 2.0D;
+    }
+
+    private void tickMiningJob() {
+        this.tickBreakingJob(pos -> this.isMiningBlock(this.level().getBlockState(pos)));
+    }
+
+    private void tickChoppingJob() {
+        this.tickBreakingJob(pos -> this.level().getBlockState(pos).is(BlockTags.LOGS));
+    }
+
+    /** 挖矿和砍树共用：找方块 → 走过去 → 一点点挖掉。 */
+    private void tickBreakingJob(Predicate<BlockPos> filter) {
+        if (this.jobPos != null && !filter.test(this.jobPos)) {
+            this.clearBreakProgress(this.jobPos);
+            this.jobPos = null;
+            this.jobBreakTicks = 0;
+        }
+
+        if (this.jobPos == null) {
+            if (this.jobScanCooldown > 0) {
+                this.jobScanCooldown--;
+                this.idleForJob();
+                return;
+            }
+            this.jobPos = this.findBlockInRange(filter);
+            this.jobScanCooldown = 20;
+            this.jobBreakTicks = 0;
+            if (this.jobPos == null) {
+                this.idleForJob();
+                return;
+            }
+        }
+
+        BlockPos pos = this.jobPos;
+        Vec3 center = Vec3.atCenterOf(pos);
+        if (this.distanceToSqr(center) > 9.0D) {
+            this.moveTowards(center);
+            return;
+        }
+
+        this.zza = 0.0F;
+        this.xxa = 0.0F;
+        this.lookAt(center.x, center.y, center.z);
+
+        BlockState state = this.level().getBlockState(pos);
+        float hardness = state.getDestroySpeed(this.level(), pos);
+        if (hardness < 0.0F) {
+            // 基岩这类挖不动的方块，直接放弃。
+            this.clearBreakProgress(pos);
+            this.jobPos = null;
+            this.jobBreakTicks = 0;
+            return;
+        }
+
+        ItemStack tool = this.getMainHandItem();
+        float speed = Math.max(1.0F, tool.getDestroySpeed(state));
+        int requiredTicks = Math.max(6, (int) (hardness * 30.0F / speed));
+        if (++this.jobBreakTicks < requiredTicks) {
+            // 每 6 tick 挥一下手，看起来就是在一下一下地敲方块（原版玩家每次左键都会挥手）。
+            if (this.jobBreakTicks % 6 == 1) {
+                this.swing(InteractionHand.MAIN_HAND);
+            }
+            // 同步挖掘裂纹：0~9 是原版的十个破坏阶段，客户端拿它画方块上的裂纹。
+            int progress = (int) (9.0F * (float) this.jobBreakTicks / (float) requiredTicks);
+            this.serverLevel().destroyBlockProgress(this.getId(), pos, progress);
+            return;
+        }
+
+        this.breakBlockAndCollect(pos, state);
+        this.jobPos = null;
+        this.jobBreakTicks = 0;
+        this.jobScanCooldown = 10;
+    }
+
+    /** 挖掉方块并把掉落物塞进伙伴背包，塞不下的掉在地上。 */
+    private void breakBlockAndCollect(BlockPos pos, BlockState state) {
+        ServerLevel level = this.serverLevel();
+        ItemStack tool = this.getMainHandItem();
+        List<ItemStack> drops = Block.getDrops(state, level, pos, level.getBlockEntity(pos), this, tool);
+        tool.mineBlock(level, state, pos, this);
+        level.destroyBlock(pos, false);
+        this.clearBreakProgress(pos);
+        for (ItemStack drop : drops) {
+            if (!this.getInventory().add(drop)) {
+                this.drop(drop, false);
+            }
+        }
+    }
+
+    /** 清掉某个方块上的挖掘裂纹动画，-1 表示“这个实体不再挖这里”。 */
+    private void clearBreakProgress(@Nullable BlockPos pos) {
+        if (pos != null) {
+            this.serverLevel().destroyBlockProgress(this.getId(), pos, -1);
+        }
+    }
+
+    @Override
+    public boolean hasInfiniteMaterials() {
+        return false;
+    }
+
+    /** 挖矿规则（白名单 / 黑名单）存在存档里，可以用指令随时改、下一 tick 就生效。 */
+    private boolean isMiningBlock(BlockState state) {
+        if (state.isAir()) {
+            return false;
+        }
+        return MiningRules.get(this.server).matches(state);
+    }
+
+    private void tickFarmingJob() {
+        // 有种子就先种，没有种子再锄地。
+        if (this.tryPlantSeed()) {
+            return;
+        }
+
+        if (!(this.getMainHandItem().getItem() instanceof HoeItem)) {
+            this.idleForJob();
+            return;
+        }
+
+        if (this.jobPos == null || !this.isTillable(this.jobPos)) {
+            if (this.jobScanCooldown > 0) {
+                this.jobScanCooldown--;
+                this.idleForJob();
+                return;
+            }
+            this.jobPos = this.findBlockInRange(this::isTillable);
+            this.jobScanCooldown = 20;
+            if (this.jobPos == null) {
+                this.idleForJob();
+                return;
+            }
+        }
+
+        BlockPos pos = this.jobPos;
+        Vec3 center = Vec3.atCenterOf(pos);
+        if (this.distanceToSqr(center) > 9.0D) {
+            this.moveTowards(center);
+            return;
+        }
+
+        this.zza = 0.0F;
+        this.xxa = 0.0F;
+        this.lookAt(center.x, center.y, center.z);
+        if (this.isTillable(pos)) {
+            // 锄地也挥一下手，并像原版锄头一样掉 1 点耐久。
+            this.swing(InteractionHand.MAIN_HAND);
+            this.getMainHandItem().hurtAndBreak(1, this, EquipmentSlot.MAINHAND);
+            this.serverLevel().setBlockAndUpdate(pos, Blocks.FARMLAND.defaultBlockState());
+            this.serverLevel().levelEvent(2001, pos, Block.getId(Blocks.FARMLAND.defaultBlockState()));
+        }
+        this.jobPos = null;
+        this.jobScanCooldown = 10;
+    }
+
+    private boolean isTillable(BlockPos pos) {
+        BlockState state = this.level().getBlockState(pos);
+        boolean soil = state.is(Blocks.DIRT) || state.is(Blocks.GRASS_BLOCK) || state.is(Blocks.COARSE_DIRT) || state.is(Blocks.ROOTED_DIRT);
+        return soil && this.level().getBlockState(pos.above()).isAir();
+    }
+
+    /** 背包里有作物种子就找一块空耕地种下去。 */
+    private boolean tryPlantSeed() {
+        Inventory inventory = this.getInventory();
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (!(stack.getItem() instanceof BlockItem blockItem) || !(blockItem.getBlock() instanceof CropBlock crop)) {
+                continue;
+            }
+            BlockPos farmland = this.findBlockInRange(pos -> this.level().getBlockState(pos).is(Blocks.FARMLAND)
+                    && this.level().getBlockState(pos.above()).isAir());
+            if (farmland == null) {
+                return false;
+            }
+            Vec3 center = Vec3.atCenterOf(farmland);
+            if (this.distanceToSqr(center) > 9.0D) {
+                this.moveTowards(center);
+                return true;
+            }
+            this.zza = 0.0F;
+            this.xxa = 0.0F;
+            this.lookAt(center.x, center.y + 0.5D, center.z);
+            // 种地也挥一下手。
+            this.swing(InteractionHand.MAIN_HAND);
+            this.serverLevel().setBlockAndUpdate(farmland.above(), crop.defaultBlockState());
+            stack.shrink(1);
+            return true;
+        }
+        return false;
+    }
+
+    /** 在以自己为中心、上下各 3 格、半径来自配置的范围内找最近的满足条件的方块。 */
+    @Nullable
+    private BlockPos findBlockInRange(Predicate<BlockPos> predicate) {
+        int radius = PPConfig.JOB_RADIUS.get();
+        BlockPos origin = this.blockPosition();
+        BlockPos best = null;
+        double bestDistance = Double.MAX_VALUE;
+        BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -3; dy <= 3; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    cursor.set(origin.getX() + dx, origin.getY() + dy, origin.getZ() + dz);
+                    if (!this.level().isLoaded(cursor) || !predicate.test(cursor)) {
+                        continue;
+                    }
+                    double distance = this.distanceToSqr(Vec3.atCenterOf(cursor));
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        best = cursor.immutable();
+                    }
+                }
+            }
+        }
+        return best;
     }
 
     private void tickFarFollow(Player owner) {
@@ -465,10 +858,36 @@ public class PartnerPlayer extends ServerPlayer {
 
     @Override
     public boolean hurt(DamageSource source, float amount) {
-        if (!this.level().isClientSide) {
-            this.beginGuard();
+        if (this.level().isClientSide) {
+            return super.hurt(source, amount);
         }
-        return super.hurt(source, amount);
+
+        // 被打之后先“僵直”半秒，别立刻又往目标走。
+        this.staggerTicks = STAGGER_TICKS;
+        this.beginGuard();
+        boolean hurt = super.hurt(source, amount);
+
+        if (hurt) {
+            Entity attacker = source.getEntity();
+            if (attacker != null && !source.is(DamageTypeTags.NO_KNOCKBACK)) {
+                double dx = this.getX() - attacker.getX();
+                double dz = this.getZ() - attacker.getZ();
+                double length = Math.sqrt(dx * dx + dz * dz);
+                if (length > 1.0E-4D) {
+                    dx /= length;
+                    dz /= length;
+                } else {
+                    dx = 0.0D;
+                    dz = 1.0D;
+                }
+                // 假玩家没有客户端，原版击退的位移常常被 AI 的行走输入吃掉，
+                // 这里显式再补一次水平冲量，并打上 hurtMarked 让服务器把速度包广播出去。
+                this.setDeltaMovement(dx * 0.35D, Math.max(this.getDeltaMovement().y, 0.35D), dz * 0.35D);
+                this.hurtMarked = true;
+            }
+        }
+
+        return hurt;
     }
 
     private void beginGuard() {

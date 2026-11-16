@@ -1,5 +1,6 @@
 package com.chinaex123.player_partner.client.menu;
 
+import com.chinaex123.player_partner.entity.PartnerJob;
 import com.chinaex123.player_partner.entity.PartnerPlayer;
 import com.chinaex123.player_partner.init.PPMenus;
 import net.minecraft.client.Minecraft;
@@ -8,6 +9,8 @@ import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.AbstractContainerMenu;
+import net.minecraft.world.inventory.ContainerData;
+import net.minecraft.world.inventory.SimpleContainerData;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.ItemStack;
 import org.jetbrains.annotations.NotNull;
@@ -54,14 +57,60 @@ public class PlayerPartnerMenu extends AbstractContainerMenu {
 
     private final Player partner;
 
+    /**
+     * 伙伴当前任务。
+     */
+    private final ContainerData jobData;
+
     public PlayerPartnerMenu(int containerId, Inventory playerInventory, Player partner) {
         super(PPMenus.PLAYER_PARTNER_MENU.get(), containerId);
         this.partner = partner;
+        this.jobData = partner instanceof PartnerPlayer partnerPlayer ? new PartnerJobData(partnerPlayer) : new SimpleContainerData(2);
+        this.addDataSlots(this.jobData);
         this.addSlots(playerInventory);
 
         // 界面打开期间伙伴站着不动。
         if (!playerInventory.player.level().isClientSide && partner instanceof PartnerPlayer partnerPlayer) {
             partnerPlayer.onMenuOpened();
+        }
+    }
+
+    /** 当前高亮用的任务；客户端读到的是同步过来的值。 */
+    public PartnerJob getDisplayedJob() {
+        return PartnerJob.byId(this.jobData.get(0));
+    }
+
+    public int getDisplayedFoodLevel() {
+        return this.jobData.get(1);
+    }
+
+    /** 服务端把伙伴的任务与饥饿值读出来给菜单数据同步用。 */
+    private static final class PartnerJobData implements ContainerData {
+        private final PartnerPlayer partner;
+
+        private PartnerJobData(PartnerPlayer partner) {
+            this.partner = partner;
+        }
+
+        @Override
+        public int get(int index) {
+            if (index == 1) {
+                return this.partner.getFoodData().getFoodLevel();
+            }
+            return this.partner.getJob().ordinal();
+        }
+
+        @Override
+        public void set(int index, int value) {
+            if (index == 1) {
+                return;
+            }
+            this.partner.setJob(PartnerJob.byId(value));
+        }
+
+        @Override
+        public int getCount() {
+            return 2;
         }
     }
 

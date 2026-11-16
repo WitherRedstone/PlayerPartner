@@ -7,6 +7,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.chinaex123.player_partner.config.PPConfig;
+import com.chinaex123.player_partner.entity.PartnerJob;
 import com.chinaex123.player_partner.entity.PartnerPlayer;
 import com.chinaex123.player_partner.network.PartnerConnection;
 import com.chinaex123.player_partner.util.PartnerSkinLookup;
@@ -67,7 +68,7 @@ public final class PartnerManager {
     }
 
     public record PartnerRecord(String displayName, String skinName, @Nullable UUID owner,
-                                ResourceKey<Level> dimension, double x, double y, double z, float yaw) {
+                                ResourceKey<Level> dimension, double x, double y, double z, float yaw, String job) {
     }
 
     public void onServerStarted() {
@@ -123,12 +124,13 @@ public final class PartnerManager {
     private void placeAndRemember(String displayName, String skinName, @Nullable UUID owner, ServerLevel level,
                                   Vec3 pos, float yaw, @Nullable GameProfile skinProfile) {
         PartnerPlayer existing = this.getPartner(displayName);
+        PartnerJob previousJob = existing == null ? PartnerJob.NONE : existing.getJob();
         if (existing != null) {
             this.remove(existing, false);
         }
 
         PartnerRecord record = new PartnerRecord(displayName, skinName, owner,
-                level.dimension(), pos.x, pos.y, pos.z, yaw);
+                level.dimension(), pos.x, pos.y, pos.z, yaw, previousJob.id());
         this.records.removeIf(old -> old.displayName().equalsIgnoreCase(displayName));
         this.records.add(record);
         this.place(record, skinProfile);
@@ -167,8 +169,7 @@ public final class PartnerManager {
                     this.remove(partner, false);
 
                     this.records.removeIf(old -> old.displayName().equalsIgnoreCase(trimmed));
-                    PartnerRecord renamed = new PartnerRecord(trimmed, trimmed, record.owner(),
-                            dimension, x, y, z, yaw);
+                    PartnerRecord renamed = new PartnerRecord(trimmed, trimmed, record.owner(), dimension, x, y, z, yaw, record.job());
                     this.records.add(renamed);
                     if (result.profile() != null) {
                         this.place(renamed, result.profile());
@@ -234,6 +235,7 @@ public final class PartnerManager {
         partner.setHealth(partner.getMaxHealth());
         partner.getFoodData().setFoodLevel(20);
         partner.getFoodData().setSaturation(5.0F);
+        partner.setJob(PartnerJob.byName(record.job()));
 
         if (partner.serverLevel() != spawnLevel) {
             partner.teleportTo(spawnLevel, record.x(), record.y(), record.z(), record.yaw(), 0.0F);
@@ -295,6 +297,19 @@ public final class PartnerManager {
         return this.active.get(uuid);
     }
 
+    public void persistJob(PartnerPlayer partner) {
+        for (int index = 0; index < this.records.size(); index++) {
+            PartnerRecord record = this.records.get(index);
+            if (PartnerPlayer.createUuid(record.displayName()).equals(partner.getUUID())) {
+                this.records.set(index, new PartnerRecord(record.displayName(), record.skinName(), record.owner(),
+                        record.dimension(), record.x(), record.y(), record.z(), record.yaw(),
+                        partner.getJob().id()));
+                this.save();
+                return;
+            }
+        }
+    }
+
     private void syncPositions() {
         Map<UUID, PartnerPlayer> alive = new HashMap<>(this.active);
         List<PartnerRecord> updated = new ArrayList<>();
@@ -306,7 +321,8 @@ public final class PartnerManager {
                 continue;
             }
             updated.add(new PartnerRecord(record.displayName(), record.skinName(), record.owner(),
-                    partner.level().dimension(), partner.getX(), partner.getY(), partner.getZ(), partner.getYRot()));
+                    partner.level().dimension(), partner.getX(), partner.getY(), partner.getZ(), partner.getYRot(),
+                    partner.getJob().id()));
         }
         this.records.clear();
         this.records.addAll(updated);
@@ -327,6 +343,7 @@ public final class PartnerManager {
                 object.addProperty("y", record.y());
                 object.addProperty("z", record.z());
                 object.addProperty("yaw", record.yaw());
+                object.addProperty("job", record.job());
                 array.add(object);
             }
             try (Writer writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
@@ -359,7 +376,8 @@ public final class PartnerManager {
                         object.get("x").getAsDouble(),
                         object.get("y").getAsDouble(),
                         object.get("z").getAsDouble(),
-                        object.get("yaw").getAsFloat()));
+                        object.get("yaw").getAsFloat(),
+                        object.has("job") ? object.get("job").getAsString() : PartnerJob.NONE.id()));
             }
         } catch (Exception exception) {
             PlayerPartner.LOGGER.warn("无法读取玩家伙伴列表", exception);

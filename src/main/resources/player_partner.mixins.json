@@ -5,7 +5,8 @@
   "mixins": [
     "PlayerTouchMixin",
     "PlayerListMixin",
-    "ConnectionAccessor"
+    "ConnectionAccessor",
+    "SleepStatusMixin"
   ],
   "client": [
     "PlayerInfoSkinMixin"
