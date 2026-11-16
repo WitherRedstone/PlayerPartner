@@ -3,6 +3,7 @@ package com.chinaex123.player_partner.entity;
 import com.mojang.authlib.GameProfile;
 import com.chinaex123.player_partner.client.menu.PlayerPartnerMenu;
 import com.chinaex123.player_partner.world.PartnerManager;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.UUIDUtil;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
@@ -36,18 +37,37 @@ public class PartnerPlayer extends ServerPlayer {
     private int wanderCooldown;
     /** 距离下一次尝试进食的 tick 数。 */
     private int eatCooldown;
-    /** 当前行为：闲逛 / 跟着主人 / 看着主人。 */
+    /** 当前行为：闲逛 / 走远时往主人那边走 / 看着主人。 */
     private int behaviour = BEHAVIOUR_WANDER;
     /** 距离下次换行为还剩多少 tick。 */
     private int behaviourTicks;
     /** 闲站着四处张望的计时。 */
     private int idleLookTicks;
+    /** 走远后尝试走向主人的次数。 */
+    private int followAttempts;
+    /** 本次尝试已经走了多少 tick。 */
+    private int followTicks;
+    /** 两次尝试之间的冷却 tick。 */
+    private int followCooldown;
+    /** 追主人时连续“走不动”的 tick 数。 */
+    private int followStuckTicks;
+    /** 有多少玩家正开着这个伙伴的物品栏；大于 0 时伙伴站着不动。 */
+    private int menuViewers;
     /** 是否已经进入移除流程。 */
     private boolean removing;
 
     private static final int BEHAVIOUR_WANDER = 0;
     private static final int BEHAVIOUR_FOLLOW = 1;
     private static final int BEHAVIOUR_WATCH = 2;
+
+    /** 超过 64 格才算“走远了”，才会尝试主动走过去。 */
+    private static final double FAR_DISTANCE_SQR = 64.0D * 64.0D;
+    /** 一次尝试最多走 5 秒。 */
+    private static final int FOLLOW_ATTEMPT_TICKS = 100;
+    /** 两次尝试之间冷却 2 秒。 */
+    private static final int FOLLOW_COOLDOWN_TICKS = 40;
+    /** 最多尝试 3 次，还走不到就直接瞬移。 */
+    private static final int MAX_FOLLOW_ATTEMPTS = 3;
 
     public PartnerPlayer(MinecraftServer server, ServerLevel level, GameProfile profile, ClientInformation information) {
         super(server, level, profile, information);
@@ -146,12 +166,32 @@ public class PartnerPlayer extends ServerPlayer {
         return this.removing;
     }
 
+    /** 有玩家打开这个伙伴的物品栏时记一笔，界面关掉之前伙伴不会乱走。 */
+    public void onMenuOpened() {
+        this.menuViewers++;
+    }
+
+    public void onMenuClosed() {
+        this.menuViewers = Math.max(0, this.menuViewers - 1);
+    }
+
+    public boolean isMenuOpen() {
+        return this.menuViewers > 0;
+    }
+
     private void tickBehaviour() {
         if (this.removing || !this.isAlive()) {
             return;
         }
 
         this.setJumping(false);
+
+        // 有人正开着伙伴的物品栏：站着别动，看着界面就行，等界面关掉再继续活动。
+        if (this.isMenuOpen()) {
+            this.zza = 0.0F;
+            this.xxa = 0.0F;
+            return;
+        }
 
         this.tickEating();
 
@@ -169,63 +209,100 @@ public class PartnerPlayer extends ServerPlayer {
         }
 
         double distance = this.distanceToSqr(owner);
-        if (distance > 1024.0D) {
-            // 离得太远就直接传送到主人身边。
+
+        // 意外保护：掉到虚空（或掉得太深）就立刻回到主人身边，别让伙伴就这么没了。
+        if (this.getY() < this.level().getMinBuildHeight() - 8.0D) {
             this.teleportTo(owner.getX(), owner.getY(), owner.getZ());
+            this.resetFollowAttempts();
             return;
         }
-        // 走散太远时优先追回来，其余时间像普通生物一样自己活动。
-        if (distance > 400.0D) {
-            this.behaviour = BEHAVIOUR_FOLLOW;
-            this.behaviourTicks = 80 + this.random.nextInt(80);
-        } else if (--this.behaviourTicks <= 0) {
+
+        // 只有走远到 64 格以外才会尝试走过去（3 次走不到就瞬移），平时不跟着玩家。
+        if (distance > FAR_DISTANCE_SQR) {
+            this.tickFarFollow(owner);
+            return;
+        }
+        if (distance < 32.0D * 32.0D) {
+            // 回到 32 格以内，重置尝试计数，下一次走远重新给 3 次机会。
+            this.resetFollowAttempts();
+        }
+
+        // 玩家在附近时，偶尔抬头看两眼。
+        if (this.behaviour != BEHAVIOUR_WATCH && distance < 100.0D && this.random.nextInt(200) == 0) {
+            this.behaviour = BEHAVIOUR_WATCH;
+            this.behaviourTicks = 40 + this.random.nextInt(60);
+        }
+
+        if (--this.behaviourTicks <= 0) {
             this.pickBehaviour(distance);
         }
 
-        switch (this.behaviour) {
-            case BEHAVIOUR_FOLLOW -> {
-                if (distance > 16.0D) {
-                    this.moveTowards(owner.position());
-                } else {
-                    // 已经走到主人身边了，换回闲逛或抬头看一看，
-                    this.zza = 0.0F;
-                    this.xxa = 0.0F;
-                    this.behaviour = this.random.nextBoolean() ? BEHAVIOUR_WANDER : BEHAVIOUR_WATCH;
-                    this.behaviourTicks = 100 + this.random.nextInt(100);
-                    this.wanderTarget = null;
-                }
-            }
-            case BEHAVIOUR_WATCH -> {
-                this.lookAt(owner.getX(), owner.getEyeY() + 0.15D, owner.getZ());
-                this.zza = 0.0F;
-                this.xxa = 0.0F;
-            }
-            default -> {
-                this.tickWander();
-                // 只有在站着不动的时候才四处张望，走路时朝行进方向看。
-                if (this.zza == 0.0F) {
-                    this.tickIdleLook();
-                }
+        // 看向主人的眼睛再往上一点点：抬头动作能看出来，但幅度不要太大。
+        if (this.behaviour == BEHAVIOUR_WATCH) {
+            this.lookAt(owner.getX(), owner.getEyeY() + 0.15D, owner.getZ());
+            this.zza = 0.0F;
+            this.xxa = 0.0F;
+        } else {
+            this.tickWander();
+            // 只有在站着不动的时候才四处张望，走路时朝行进方向看。
+            if (this.zza == 0.0F) {
+                this.tickIdleLook();
             }
         }
     }
 
-    private void pickBehaviour(double distanceToOwner) {
-        if (distanceToOwner > 64.0D) {
-            // 离得比较远了，先跟过去。
-            this.behaviour = BEHAVIOUR_FOLLOW;
-            this.behaviourTicks = 100 + this.random.nextInt(80);
+    private void tickFarFollow(Player owner) {
+        this.behaviour = BEHAVIOUR_FOLLOW;
+
+        if (this.followCooldown > 0) {
+            this.followCooldown--;
+            this.zza = 0.0F;
+            this.xxa = 0.0F;
             return;
         }
 
+        if (this.followAttempts >= MAX_FOLLOW_ATTEMPTS) {
+            // 三次都走不过去，直接瞬移过去。
+            this.teleportTo(owner.getX(), owner.getY(), owner.getZ());
+            this.resetFollowAttempts();
+            return;
+        }
+
+        boolean moved = this.moveTowards(owner.position());
+        if (!moved) {
+            this.followStuckTicks++;
+            this.zza = 0.0F;
+            if (this.followStuckTicks >= 10) {
+                this.followStuckTicks = 0;
+                this.followTicks = 0;
+                this.followAttempts++;
+                this.followCooldown = FOLLOW_COOLDOWN_TICKS;
+            }
+            return;
+        }
+        this.followStuckTicks = 0;
+
+        if (++this.followTicks >= FOLLOW_ATTEMPT_TICKS) {
+            this.followTicks = 0;
+            this.followAttempts++;
+            this.followCooldown = FOLLOW_COOLDOWN_TICKS;
+            this.zza = 0.0F;
+        }
+    }
+
+    private void resetFollowAttempts() {
+        this.followAttempts = 0;
+        this.followTicks = 0;
+        this.followCooldown = 0;
+        this.followStuckTicks = 0;
+    }
+
+    private void pickBehaviour(double distanceToOwner) {
         int roll = this.random.nextInt(100);
-        if (roll < 55) {
+        if (roll < 75) {
             this.behaviour = BEHAVIOUR_WANDER;
             this.behaviourTicks = 120 + this.random.nextInt(160);
             this.wanderTarget = null;
-        } else if (roll < 85) {
-            this.behaviour = BEHAVIOUR_FOLLOW;
-            this.behaviourTicks = 60 + this.random.nextInt(80);
         } else {
             this.behaviour = BEHAVIOUR_WATCH;
             this.behaviourTicks = 40 + this.random.nextInt(60);
@@ -249,19 +326,28 @@ public class PartnerPlayer extends ServerPlayer {
         this.setXRot((float) Mth.approach(this.getXRot(), Mth.clamp(targetPitch, -25.0F, 25.0F), 6.0F));
     }
 
-    private void moveTowards(Vec3 target) {
+    private boolean moveTowards(Vec3 target) {
         double dx = target.x - this.getX();
         double dz = target.z - this.getZ();
         double horizontal = Math.sqrt(dx * dx + dz * dz);
         if (horizontal < 0.8D) {
             this.zza = 0.0F;
-            return;
+            return true;
+        }
+
+        // 主动避让“没有方块”的方向：往前 0.8 格的脚下 4 格都找不到实体方块就不走，
+        if (!this.hasGroundAhead(dx, dz)) {
+            this.zza = 0.0F;
+            return false;
         }
 
         float yaw = (float) (Mth.atan2(dz, dx) * (180.0D / Math.PI)) - 90.0F;
         this.setYRot(yaw);
         this.yHeadRot = yaw;
         this.yBodyRot = yaw;
+
+        // 走路时把头摆正
+        this.setXRot((float) Mth.approach(this.getXRot(), 0.0F, 8.0F));
 
         this.zza = 1.0F;
         this.xxa = 0.0F;
@@ -271,15 +357,43 @@ public class PartnerPlayer extends ServerPlayer {
         } else if (this.horizontalCollision && this.onGround() && this.random.nextInt(6) == 0) {
             this.setJumping(true);
         }
+        return true;
+    }
+
+    private boolean hasGroundAhead(double dx, double dz) {
+        // 游泳、爬梯子、鞘翅飞行时本来就不需要地面。
+        if (this.isInWater() || this.isInLava() || this.onClimbable() || this.isFallFlying()) {
+            return true;
+        }
+
+        double length = Math.sqrt(dx * dx + dz * dz);
+        if (length < 1.0E-4D) {
+            return true;
+        }
+        double nx = this.getX() + dx / length * 0.8D;
+        double nz = this.getZ() + dz / length * 0.8D;
+
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        for (int dy = 0; dy >= -4; dy--) {
+            pos.set(nx, this.getY() + dy, nz);
+            if (!this.level().getBlockState(pos).getCollisionShape(this.level(), pos).isEmpty()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void tickWander() {
         if (--this.wanderCooldown <= 0 || this.wanderTarget == null) {
             this.wanderCooldown = 60 + this.random.nextInt(80);
-            double angle = this.random.nextDouble() * Math.PI * 2.0D;
-            double distance = 3.0D + this.random.nextDouble() * 4.0D;
-            this.wanderTarget = new Vec3(this.getX() + Math.cos(angle) * distance, this.getY(),
-                    this.getZ() + Math.sin(angle) * distance);
+            this.wanderTarget = this.pickWanderTarget();
+        }
+
+        if (this.wanderTarget == null) {
+            // 周围没有安全的方向，就原地待着。
+            this.zza = 0.0F;
+            this.xxa = 0.0F;
+            return;
         }
 
         if (this.wanderTarget.distanceToSqr(this.position()) < 1.0D) {
@@ -288,7 +402,25 @@ public class PartnerPlayer extends ServerPlayer {
             return;
         }
 
-        this.moveTowards(this.wanderTarget);
+        if (!this.moveTowards(this.wanderTarget)) {
+            // 走不过去就丢掉这个目标，下一 tick 重新挑一个安全的方向。
+            this.wanderTarget = null;
+            this.wanderCooldown = 0;
+        }
+    }
+
+    @Nullable
+    private Vec3 pickWanderTarget() {
+        for (int attempt = 0; attempt < 6; attempt++) {
+            double angle = this.random.nextDouble() * Math.PI * 2.0D;
+            double distance = 3.0D + this.random.nextDouble() * 4.0D;
+            double tx = this.getX() + Math.cos(angle) * distance;
+            double tz = this.getZ() + Math.sin(angle) * distance;
+            if (this.hasGroundAhead(tx - this.getX(), tz - this.getZ())) {
+                return new Vec3(tx, this.getY(), tz);
+            }
+        }
+        return null;
     }
 
     private void lookAt(double x, double y, double z) {

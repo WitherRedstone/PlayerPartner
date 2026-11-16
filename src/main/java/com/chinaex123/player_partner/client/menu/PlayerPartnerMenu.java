@@ -1,5 +1,6 @@
 package com.chinaex123.player_partner.client.menu;
 
+import com.chinaex123.player_partner.entity.PartnerPlayer;
 import com.chinaex123.player_partner.init.PPMenus;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.RegistryFriendlyByteBuf;
@@ -57,6 +58,20 @@ public class PlayerPartnerMenu extends AbstractContainerMenu {
         super(PPMenus.PLAYER_PARTNER_MENU.get(), containerId);
         this.partner = partner;
         this.addSlots(playerInventory);
+
+        // 界面打开期间伙伴站着不动。
+        if (!playerInventory.player.level().isClientSide && partner instanceof PartnerPlayer partnerPlayer) {
+            partnerPlayer.onMenuOpened();
+        }
+    }
+
+    @Override
+    public void removed(Player player) {
+        super.removed(player);
+        // 界面关掉后伙伴恢复活动。
+        if (!player.level().isClientSide && this.partner instanceof PartnerPlayer partnerPlayer) {
+            partnerPlayer.onMenuClosed();
+        }
     }
 
     public PlayerPartnerMenu(int containerId, Inventory playerInventory, RegistryFriendlyByteBuf data) {
