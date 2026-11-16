@@ -1,7 +1,19 @@
 {
-  "entity.player_partner.player_partner": "Player Partner",
   "item.player_partner.player_partner_spawn_egg": "Player Partner Spawn Egg",
+  "item.player_partner.partner_summoner": "Player Partner Summoner",
+
   "container.player_partner.inventory": "Player Partner",
+
   "message.player_partner.skin_not_found": "Player Partner: no premium account named \"%s\" was found. Write a correct premium ID on the name tag.",
-  "message.player_partner.skin_network_error": "Player Partner: could not reach the Minecraft skin server. Please check your network connection."
+  "message.player_partner.skin_network_error": "Player Partner: could not reach the Minecraft skin server. Please check your network connection.",
+  "message.player_partner.skin_not_found_default": "Player Partner: no premium account named \"%s\" was found, so the built-in default skin is used.",
+  "message.player_partner.skin_network_error_default": "Player Partner: the skin server is unreachable, so the built-in default skin is used for now. Write an ID on a name tag later to change it.",
+  "message.player_partner.spawned": "Spawned Player Partner: %s",
+  "message.player_partner.removed": "Removed Player Partner: %s",
+  "message.player_partner.renamed": "The Player Partner is now called: %s (skin updated)",
+  "message.player_partner.not_found": "No Player Partner nearby.",
+  "message.player_partner.need_player": "This command can only be run by a player.",
+  "message.player_partner.limit": "The partner limit (%s) has been reached. Change partnerLimit in the config file.",
+  "message.player_partner.list": "Player Partners: %s",
+  "message.player_partner.list_empty": "There are no Player Partners."
 }

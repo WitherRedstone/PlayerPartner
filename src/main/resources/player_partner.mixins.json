@@ -2,7 +2,14 @@
   "required": true,
   "package": "com.chinaex123.player_partner.mixin",
   "compatibilityLevel": "JAVA_21",
-  "mixins": [],
+  "mixins": [
+    "PlayerTouchMixin",
+    "PlayerListMixin",
+    "ConnectionAccessor"
+  ],
+  "client": [
+    "PlayerInfoSkinMixin"
+  ],
   "injectors": {
     "defaultRequire": 1
   },
